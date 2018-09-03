@@ -1,4 +1,5 @@
 #include "cpu.h"
+#include <array>
 
 int main()
 {
@@ -8,7 +9,11 @@ int main()
 	using u16_t = std::uint16_t;
 	using u8_t = std::uint8_t;
 
-	cu::test::abc_print();
+	using arr_t  = std::array<uint32_t, 16>;
+
+	std::cout << CU_SIZEOF_STRING(arr_t) << std::endl;
+
+	cu::test::contig_print();
 
 	cu::test::print_cache_params<u64_t, base_t>();
 	cu::test::print_cache_params<u32_t, base_t>();

@@ -5,9 +5,10 @@
 #include <cmath>
 #include <sstream>
 #include <iostream>
+#include <array>
 
 #define CU_COMP_TIME static constexpr
-#define CU_FUNC
+#define CU_FUNC static
 #define CU_FUNC_COMP_TIME static constexpr
 #define CU_STREAM_VALUE(v) #v ": " << (unsigned int)v << ",\n"
 #define CU_STATIC_IF if constexpr
@@ -17,11 +18,28 @@ namespace cu {
 using default_word_t = std::uint64_t;
 
 namespace detail {
-	CU_COMP_TIME default_word_t log2i(default_word_t n)
-	{
-		return (n < 2) ? 1 : 1 + log2i(n / 2);
-	}
-};
+
+CU_COMP_TIME default_word_t log2i(default_word_t n)
+{
+	return (n < 2) ? 1 : 1 + log2i(n / 2);
+}
+
+
+template <typename T, size_t N>
+CU_FUNC_COMP_TIME T align(T x)
+{
+	constexpr auto U = N - 1;
+	return ((x + U) & (~U));
+}
+
+template <typename T, size_t N>
+using static_mem_t = std::array<T, N>;
+
+} // end namespace detail
+
+//----------------------------------------------
+// CPU Cache params
+//----------------------------------------------
 
 // We (hopefully) avoid UB by calculating everything up front with the highest word size
 // and then converting after the fact.
@@ -102,107 +120,224 @@ using x32rb = arch_x86_64_cache_reg_byte;
 
 using template_int_t = int;
 
-template <typename memType, typename... Args>
-struct decl_struct
-{
-	using mem_type = memType;
+#ifdef _WIN64
+using cache_params_t = x64rwq;
+#else
+using cache_params_t = x32rwd;
+#endif
 
-	memType data;
-	decl_struct<Args...> next;
-};
+template <typename T>
+using cache_blocked_t = detail::static_mem_t<T, cache_params_t::num_bytes_per_block / sizeof(T)>;
 
-template <typename memType>
-struct decl_struct<memType>
-{
-	using mem_type = memType;
+//----------------------------------------------
+// base routines
+//----------------------------------------------
 
-	memType data;
-};
-
-template <>
-struct decl_struct<void>
-{
-};
-
-template <typename memType, typename ...Args>
-CU_FUNC_COMP_TIME decl_struct<Args...> pass_through(decl_struct<memType, Args...>&& p)
-{
-	return s.next;
-}
-
-template <typename memType>
-CU_FUNC_COMP_TIME decl_struct<memType> pass_through(decl_struct<memType>&& p)
-{
-	return s;
-}
+namespace detail {
 
 template <bool cond, typename trueType, typename falseType>
-struct type_if
-{
+struct type_if {
 	using type = trueType;
 };
 
 template <typename trueType, typename falseType>
-struct type_if<false, trueType, falseType>
-{
+struct type_if<false, trueType, falseType> {
 	using type = falseType;
 };
 
 template <template_int_t count, typename memType, typename ...Args>
-struct pop_type
-{
+struct pop_type {
 	using value_type = typename pop_type<count - 1, Args...>::value_type;
 };
 
 template <typename memType, typename ...Args>
-struct pop_type<0, memType, Args...>
-{
+struct pop_type<0, memType, Args...> {
 	using value_type = memType;
 };
 
-template <template_int_t offset, typename memType, typename ...Args>
-struct get_impl;
+template <template_int_t offset, template <typename... Args> typename nextWrapType, typename memType, typename ...Args>
+struct get_member_impl {
+	using this_type = memType;
+	using block_type = cache_blocked_t<this_type>;
 
-template <template_int_t offset, typename memType, typename ...Args>
-struct get_impl
-{
-	static typename pop_type<offset, memType, Args...>::value_type call(decl_struct<memType, Args...> s)
+	template <typename... Args>
+	using aggregate_type = nextWrapType<Args...>;
+	
+	CU_FUNC_COMP_TIME typename pop_type<offset, memType, Args...>::value_type & call(this_type &s)
 	{
-		return get_impl<offset - 1, Args...>::call(s.next);
+		using next_type = typename aggregate_type<Args...>::this_type;
+		using this_type = memType;
+
+		auto p_next = reinterpret_cast<next_type *>(static_cast<this_type *>(&s) + 1);
+
+		return get_member_impl<offset - 1, aggregate_type, Args...>::call(*p_next); 
+	}
+
+	CU_FUNC typename pop_type<offset, memType, Args...>::value_type & call_array(block_type &s, default_word_t index)
+	{
+		using next_block_type = typename aggregate_type<Args...>::block_type;
+
+		auto p_next = reinterpret_cast<next_block_type *>(static_cast<this_type *>(s.data()) + s.size());
+
+		return get_member_impl<offset - 1, aggregate_type, Args...>::call_array(*p_next, index); 
 	}
 };
+
+template <template <typename ...Args> class nextWrapType, typename memType, typename ...Args>
+struct get_member_impl<0, nextWrapType, memType, Args...> {
+	using this_type = memType;
+	using block_type = cache_blocked_t<this_type>;
+
+	CU_FUNC_COMP_TIME typename pop_type<0, this_type, Args...>::value_type & call(this_type &s)
+	{
+		return s;
+	}
+
+	CU_FUNC typename pop_type<0, this_type, Args...>::value_type & call_array(block_type &s, default_word_t index)
+	{
+		return s.at(index);
+	}
+};
+
+} // end namespace detail
+
+//----------------------------------------------
+// contiguous memory
+//----------------------------------------------
 
 template <typename memType, typename ...Args>
-struct get_impl<0, memType, Args...>
-{
-	static typename pop_type<0, memType, Args...>::value_type call(decl_struct<memType, Args...> s)
-	{
-		return s.data;
-	}
+struct contig_mem {
+	using this_type = memType;
+	using next_head_type = contig_mem<Args...>;
+
+	this_type mem;
+	typename next_head_type::this_type next;
 };
 
+template <typename memType>
+struct contig_mem<memType> {
+	using this_type = memType;
+
+	this_type mem;
+};
+
+template <>
+struct contig_mem<void> {};
+
 template <template_int_t offset, typename memType, typename ...Args>
-CU_FUNC_COMP_TIME typename pop_type<offset, memType, Args...>::value_type get(decl_struct<memType, Args...> s)
+typename detail::pop_type<offset, memType, Args...>::value_type & member(contig_mem<memType, Args...> &s)
 {
-	return get_impl<offset, memType, Args...>::call(s);
+	return detail::get_member_impl<offset, contig_mem, memType, Args...>::call(s.mem);
 }
+
+//----------------------------------------------
+// cache friendly data
+//----------------------------------------------
+
+template <typename memType, typename ...Args>
+struct cache_friendly {
+	using this_type = memType;
+	using block_type = cache_blocked_t<this_type>;
+	using next_head_type = contig_mem<Args...>;
+	
+	block_type mem;
+	typename next_head_type::this_type next;
+};
+
+template <typename memType>
+struct cache_friendly<memType> {
+	using this_type = memType;
+	using block_type = cache_blocked_t<this_type>;
+
+	block_type mem;
+};
+
+template <>
+struct cache_friendly<void> {};
+
+template <template_int_t offset, typename memType, typename ...Args>
+typename detail::pop_type<offset, memType, Args...>::value_type & member(cache_friendly<memType, Args...> &s, default_word_t index = 0)
+{
+	return detail::get_member_impl<offset, cache_friendly, memType, Args...>::call_array(s.mem, index);
+}
+
+//----------------------------------------------
+// con
+//----------------------------------------------
+
+#define CU_CACHE_FRIENDLY
+
+template <typename memType, typename... Args>
+#ifdef CU_CACHE_FRIENDLY
+using aggregate_t = cache_friendly<memType, Args...>;
+#else
+using aggregate_t = contig_mem<memType, Args...>;
+#endif
+
+//----------------------------------------------
+// tests
+//----------------------------------------------
+
 
 namespace test {
 
-using abc_t = decl_struct<uint8_t, uint32_t, uint16_t>;
+using contig1_t = aggregate_t<uint32_t, uint16_t, uint8_t>;
 
-CU_FUNC void abc_print()
+using u32lim_t = std::numeric_limits<uint32_t>;
+using u16lim_t = std::numeric_limits<uint16_t>;
+using u8lim_t = std::numeric_limits<uint8_t>;
+
+template <typename T>
+CU_FUNC T mmax()
 {
-	abc_t t{};
+	return std::numeric_limits<T>::max();
+}
 
-	auto a = get<0>(t);
-	auto b = get<1>(t);
-	auto c = get<2>(t);
+#define CU_MAX(x) std::numeric_limits<decltype(x)>::max() 
 
-	std::cout << sizeof(a) << "\n"
-		      << sizeof(b) << "\n"
-		      << sizeof(c) << "\n"
-		      << std::endl;
+#define CU_SIZEOF_STRING(type) "sizeof(" #type "): " << sizeof(type)
+
+CU_FUNC void contig_print()
+{
+	contig1_t lol;
+
+	{
+		auto &a = member<0>(lol, 1);
+		auto &b = member<1>(lol, 1);
+		auto &c = member<2>(lol, 1);
+
+		a = 3;
+		b = 2;
+		c = 1;
+	}
+
+	{
+		auto &a = member<0>(lol);
+		auto &b = member<1>(lol);
+		auto &c = member<2>(lol);
+
+		std::cout << "index 0\n\n"
+				  << sizeof(a) << "\n"
+				  << sizeof(b) << "\n"
+				  << sizeof(c) << "\n"
+				  << std::endl;
+
+		std::cout << std::hex << a << "\n" << b << "\n" << (uint32_t)c << "\n" << std::endl;
+	}
+
+	{
+		auto &a = member<0>(lol, 1);
+		auto &b = member<1>(lol, 1);
+		auto &c = member<2>(lol, 1);
+
+		std::cout << "index 1\n\n"
+				  << sizeof(a) << "\n"
+				  << sizeof(b) << "\n"
+				  << sizeof(c) << "\n"
+				  << std::endl;
+
+		std::cout << a << "\n" << b << "\n" << (uint32_t)c << "\n" << std::endl;
+	}
 }
 
 template <typename wordType, typename baseType>
