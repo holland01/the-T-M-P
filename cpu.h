@@ -118,7 +118,7 @@ using x32rwd = arch_x86_cache_reg_wordd;
 using x32rw = arch_x86_cache_reg_word;
 using x32rb = arch_x86_64_cache_reg_byte;
 
-using template_int_t = int;
+using template_int_t = int64_t;
 
 #ifdef _WIN64
 using cache_params_t = x64rwq;
@@ -134,6 +134,14 @@ using cache_blocked_t = detail::static_mem_t<T, cache_params_t::num_bytes_per_bl
 //----------------------------------------------
 
 namespace detail {
+
+struct false_type {
+	static constexpr bool value = false;
+};
+
+struct true_type {
+	static constexpr bool value = true;
+};
 
 template <bool cond, typename trueType, typename falseType>
 struct type_if {
@@ -153,6 +161,26 @@ struct pop_type {
 template <typename memType, typename ...Args>
 struct pop_type<0, memType, Args...> {
 	using value_type = memType;
+};
+
+template <template_int_t ta, template_int_t tb>
+struct larger {
+	CU_COMP_TIME template_int_t value = ta > tb ? ta : tb; 
+};
+
+template <template_int_t tvalue, template_int_t... targs>
+struct greatest {
+	CU_COMP_TIME template_int_t cmp_value = tvalue;
+
+	using next_level = typename greatest<targs...>;
+
+	CU_COMP_TIME template_int_t value = larger<cmp_value, next_level::value>::value;
+};
+
+template <template_int_t tvalue>
+struct greatest<tvalue> {
+	CU_COMP_TIME template_int_t cmp_value = tvalue;
+	CU_COMP_TIME template_int_t value = cmp_value;
 };
 
 template <template_int_t offset, template <typename... Args> typename nextWrapType, typename memType, typename ...Args>
@@ -238,8 +266,12 @@ template <typename memType, typename ...Args>
 struct cache_friendly {
 	using this_type = memType;
 	using block_type = cache_blocked_t<this_type>;
-	using next_head_type = contig_mem<Args...>;
-	
+	using next_head_type = typename cache_friendly<Args...>;
+
+	static constexpr default_word_t max_type_size = detail::larger<sizeof(this_type), next_head_type::max_type_size>::value;
+	static constexpr default_word_t array_length = cache_params_t::num_bytes_per_block / max_type_size;
+	static constexpr default_word_t bytes_left = sizeof(block_type) + next_head_type::bytes_left; 
+
 	block_type mem;
 	typename next_head_type::this_type next;
 };
@@ -248,6 +280,9 @@ template <typename memType>
 struct cache_friendly<memType> {
 	using this_type = memType;
 	using block_type = cache_blocked_t<this_type>;
+
+	static constexpr default_word_t max_type_size = sizeof(this_type);
+	static constexpr default_word_t bytes_left = sizeof(block_type);
 
 	block_type mem;
 };
@@ -281,7 +316,7 @@ using aggregate_t = contig_mem<memType, Args...>;
 
 namespace test {
 
-using contig1_t = aggregate_t<uint32_t, uint16_t, uint8_t>;
+using contig1_t = aggregate_t<uint32_t, uint16_t, uint8_t, uint64_t>;
 
 using u32lim_t = std::numeric_limits<uint32_t>;
 using u16lim_t = std::numeric_limits<uint16_t>;
@@ -293,7 +328,7 @@ CU_FUNC T mmax()
 	return std::numeric_limits<T>::max();
 }
 
-#define CU_MAX(x) std::numeric_limits<decltype(x)>::max() 
+#define CU_MAX(x) std::numeric_limits<x>::max() 
 
 #define CU_SIZEOF_STRING(type) "sizeof(" #type "): " << sizeof(type)
 
@@ -301,20 +336,30 @@ CU_FUNC void contig_print()
 {
 	contig1_t lol;
 
+	std::cout 
+		<< CU_STREAM_VALUE(contig1_t::max_type_size)
+		<<	CU_SIZEOF_STRING(contig1_t) << ",\n" 
+		<<	CU_STREAM_VALUE(contig1_t::array_length)  
+		<< CU_STREAM_VALUE(lol.bytes_left)
+		<< std::endl;
+
 	{
 		auto &a = member<0>(lol, 1);
 		auto &b = member<1>(lol, 1);
 		auto &c = member<2>(lol, 1);
+		auto &d = member<3>(lol, 1);
 
-		a = 3;
-		b = 2;
-		c = 1;
+		a = CU_MAX(uint32_t);
+		b = CU_MAX(uint16_t);
+		c = CU_MAX(uint8_t);
+		d = CU_MAX(uint64_t);
 	}
 
 	{
 		auto &a = member<0>(lol);
 		auto &b = member<1>(lol);
 		auto &c = member<2>(lol);
+		auto &d = member<3>(lol);
 
 		std::cout << "index 0\n\n"
 				  << sizeof(a) << "\n"
@@ -322,13 +367,15 @@ CU_FUNC void contig_print()
 				  << sizeof(c) << "\n"
 				  << std::endl;
 
-		std::cout << std::hex << a << "\n" << b << "\n" << (uint32_t)c << "\n" << std::endl;
+		std::cout << std::hex << a << "\n" << b << "\n" << (uint32_t)c << "\n" << d << "\n" << std::endl;
+		 
 	}
 
 	{
 		auto &a = member<0>(lol, 1);
 		auto &b = member<1>(lol, 1);
 		auto &c = member<2>(lol, 1);
+		auto &d = member<3>(lol, 1);
 
 		std::cout << "index 1\n\n"
 				  << sizeof(a) << "\n"
@@ -336,8 +383,15 @@ CU_FUNC void contig_print()
 				  << sizeof(c) << "\n"
 				  << std::endl;
 
-		std::cout << a << "\n" << b << "\n" << (uint32_t)c << "\n" << std::endl;
+		std::cout << a << "\n" << b << "\n" << (uint32_t)c << "\n" << d << "\n" << std::endl;
 	}
+}
+
+CU_FUNC void print_constexpr_max()
+{
+	auto m = detail::greatest<1, 2, 3, 4, 5, 6, 7>::value;
+
+	std::cout << "m: " << m << std::endl;
 }
 
 template <typename wordType, typename baseType>

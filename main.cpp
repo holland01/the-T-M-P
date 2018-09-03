@@ -14,7 +14,7 @@ int main()
 	std::cout << CU_SIZEOF_STRING(arr_t) << std::endl;
 
 	cu::test::contig_print();
-
+	cu::test::print_constexpr_max();
 	cu::test::print_cache_params<u64_t, base_t>();
 	cu::test::print_cache_params<u32_t, base_t>();
 	cu::test::print_cache_params<u16_t, base_t>();
