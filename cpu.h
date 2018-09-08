@@ -1,5 +1,11 @@
 #pragma once
 
+#include <DirectXMath.h>
+#include <Windows.h>
+
+#undef max
+#undef min
+
 #include <cstdint>
 #include <cstdlib>
 #include <cmath>
@@ -9,9 +15,11 @@
 
 #define CU_COMP_TIME static constexpr
 #define CU_FUNC static
-#define CU_FUNC_COMP_TIME static constexpr
+#define CU_FUNC_COMP_TIME static inline constexpr
 #define CU_STREAM_VALUE(v) #v ": " << (unsigned int)v << ",\n"
 #define CU_STATIC_IF if constexpr
+
+#define CU_CACHE_ALIGNED __declspec(align(16))
 
 namespace cu {
 
@@ -130,7 +138,7 @@ template <typename T>
 using cache_blocked_t = detail::static_mem_t<T, cache_params_t::num_bytes_per_block / sizeof(T)>;
 
 //----------------------------------------------
-// base routines
+// base meta routines
 //----------------------------------------------
 
 namespace detail {
@@ -183,7 +191,7 @@ struct greatest<tvalue> {
 	CU_COMP_TIME template_int_t value = cmp_value;
 };
 
-template <template_int_t offset, template <typename... Args> typename nextWrapType, typename memType, typename ...Args>
+template <template_int_t offset, template <typename ...Args> typename nextWrapType, typename memType, typename ...Args>
 struct get_member_impl {
 	using this_type = memType;
 	using block_type = cache_blocked_t<this_type>;
@@ -191,23 +199,35 @@ struct get_member_impl {
 	template <typename... Args>
 	using aggregate_type = nextWrapType<Args...>;
 	
-	CU_FUNC_COMP_TIME typename pop_type<offset, memType, Args...>::value_type & call(this_type &s)
+	using return_type = typename pop_type<offset, memType, Args...>::value_type;
+	using next_get_member_impl = get_member_impl<offset - 1, aggregate_type, Args...>;
+
+	using next_block_type = typename aggregate_type<Args...>::block_type;
+	using next_type = typename aggregate_type<Args...>::this_type;
+
+	template <typename nextType>
+	CU_FUNC nextType * skip_memory(this_type *base, std::size_t offset)
 	{
-		using next_type = typename aggregate_type<Args...>::this_type;
-		using this_type = memType;
-
-		auto p_next = reinterpret_cast<next_type *>(static_cast<this_type *>(&s) + 1);
-
-		return get_member_impl<offset - 1, aggregate_type, Args...>::call(*p_next); 
+		return reinterpret_cast<nextType *>(base + offset);
 	}
 
-	CU_FUNC typename pop_type<offset, memType, Args...>::value_type & call_array(block_type &s, default_word_t index)
+	CU_FUNC_COMP_TIME return_type & call(this_type &s)
 	{
-		using next_block_type = typename aggregate_type<Args...>::block_type;
+		auto p_next = skip_memory<next_type>(&s, 1);
+		return next_get_member_impl::call(*p_next); 
+	}
 
-		auto p_next = reinterpret_cast<next_block_type *>(static_cast<this_type *>(s.data()) + s.size());
+	template <template_int_t index>
+	CU_FUNC_COMP_TIME return_type & call_array_static(block_type &s)
+	{		
+		auto p_next = skip_memory<next_block_type>(s.data(), s.size());	
+		return next_get_member_impl::call_array_static<index>(*p_next); 
+	}
 
-		return get_member_impl<offset - 1, aggregate_type, Args...>::call_array(*p_next, index); 
+	CU_FUNC return_type & call_array(block_type &s, default_word_t index)
+	{
+		auto p_next = skip_memory<next_block_type>(s.data(), s.size());
+		return next_get_member_impl::call_array(*p_next, index); 
 	}
 };
 
@@ -215,13 +235,20 @@ template <template <typename ...Args> class nextWrapType, typename memType, type
 struct get_member_impl<0, nextWrapType, memType, Args...> {
 	using this_type = memType;
 	using block_type = cache_blocked_t<this_type>;
+	using return_type =  typename pop_type<0, this_type, Args...>::value_type;
 
-	CU_FUNC_COMP_TIME typename pop_type<0, this_type, Args...>::value_type & call(this_type &s)
+	CU_FUNC_COMP_TIME return_type & call(this_type &s)
 	{
 		return s;
 	}
 
-	CU_FUNC typename pop_type<0, this_type, Args...>::value_type & call_array(block_type &s, default_word_t index)
+	template <template_int_t index>
+	CU_FUNC_COMP_TIME return_type & call_array_static(block_type &s)
+	{
+		return s.at(index);
+	}
+
+	CU_FUNC return_type & call_array(block_type &s, default_word_t index)
 	{
 		return s.at(index);
 	}
@@ -253,7 +280,10 @@ template <>
 struct contig_mem<void> {};
 
 template <template_int_t offset, typename memType, typename ...Args>
-typename detail::pop_type<offset, memType, Args...>::value_type & member(contig_mem<memType, Args...> &s)
+using member_return_type = typename detail::pop_type<offset, memType, Args...>::value_type;
+
+template <template_int_t offset, typename memType, typename ...Args>
+CU_FUNC_COMP_TIME member_return_type<offset, memType, Args...> & member(contig_mem<memType, Args...> &s)
 {
 	return detail::get_member_impl<offset, contig_mem, memType, Args...>::call(s.mem);
 }
@@ -263,10 +293,10 @@ typename detail::pop_type<offset, memType, Args...>::value_type & member(contig_
 //----------------------------------------------
 
 template <typename memType, typename ...Args>
-struct cache_friendly {
+struct CU_CACHE_ALIGNED cache_mem {
 	using this_type = memType;
 	using block_type = cache_blocked_t<this_type>;
-	using next_head_type = typename cache_friendly<Args...>;
+	using next_head_type = typename cache_mem<Args...>;
 
 	static constexpr default_word_t max_type_size = detail::larger<sizeof(this_type), next_head_type::max_type_size>::value;
 	static constexpr default_word_t array_length = cache_params_t::num_bytes_per_block / max_type_size;
@@ -277,7 +307,7 @@ struct cache_friendly {
 };
 
 template <typename memType>
-struct cache_friendly<memType> {
+struct CU_CACHE_ALIGNED cache_mem<memType> {
 	using this_type = memType;
 	using block_type = cache_blocked_t<this_type>;
 
@@ -288,12 +318,18 @@ struct cache_friendly<memType> {
 };
 
 template <>
-struct cache_friendly<void> {};
+struct cache_mem<void> {};
 
 template <template_int_t offset, typename memType, typename ...Args>
-typename detail::pop_type<offset, memType, Args...>::value_type & member(cache_friendly<memType, Args...> &s, default_word_t index = 0)
+member_return_type<offset, memType, Args...> & member(cache_mem<memType, Args...> &s, default_word_t index = 0)
 {
-	return detail::get_member_impl<offset, cache_friendly, memType, Args...>::call_array(s.mem, index);
+	return detail::get_member_impl<offset, cache_mem, memType, Args...>::call_array(s.mem, index);
+}
+
+template <template_int_t offset, template_int_t index, typename memType, typename ...Args>
+CU_FUNC_COMP_TIME member_return_type<offset, memType, Args...> & member(cache_mem<memType, Args...> &s)
+{
+	return detail::get_member_impl<offset, cache_mem, memType, Args...>::call_array_static<index>(s.mem);
 }
 
 //----------------------------------------------
@@ -304,7 +340,7 @@ typename detail::pop_type<offset, memType, Args...>::value_type & member(cache_f
 
 template <typename memType, typename... Args>
 #ifdef CU_CACHE_FRIENDLY
-using aggregate_t = cache_friendly<memType, Args...>;
+using aggregate_t = cache_mem<memType, Args...>;
 #else
 using aggregate_t = contig_mem<memType, Args...>;
 #endif
@@ -332,6 +368,206 @@ CU_FUNC T mmax()
 
 #define CU_SIZEOF_STRING(type) "sizeof(" #type "): " << sizeof(type)
 
+using vertex_cmem_t = cache_mem<
+	DirectX::XMVECTOR, 
+	DirectX::XMVECTOR, 
+	
+	float, 
+	float, 
+
+	uint8_t,
+	uint8_t,
+	uint8_t,
+	uint8_t
+>;
+
+enum  {
+	vertex_cmem_position = 0,
+	vertex_cmem_normal,
+	
+	vertex_cmem_tex_u,
+	vertex_cmem_tex_v,
+
+	vertex_cmem_color_r,
+	vertex_cmem_color_g,
+	vertex_cmem_color_b,
+	vertex_cmem_color_a
+};
+
+#define vertex_cmem_get(inst, member_suffix, index) member<vertex_cmem_##member_suffix>(inst, index)
+
+struct vertex
+{
+	DirectX::XMVECTOR position;
+	DirectX::XMVECTOR normal;
+	
+	float tex_u;
+	float tex_v;
+
+	uint8_t color_r;
+	uint8_t	color_g;
+	uint8_t	color_b;
+	uint8_t	color_a;
+};
+
+using vertex_array_t = std::array<vertex, vertex_cmem_t::array_length>;
+
+template <template_int_t tnum_iterations, typename runFunc, typename ...Args>
+struct benchmark {
+	using run_func_type = runFunc;
+
+	using bench_time_t = double;
+
+	LARGE_INTEGER win_perf_counter{};
+	LARGE_INTEGER win_perf_counter_end{};
+
+	bench_time_t time_value_avg{};
+	bench_time_t time_value_start{};
+	bench_time_t inverse_iterations{};
+	bench_time_t win_time_perf_frequency{};
+
+	DWORD	win_error_code = ERROR_SUCCESS;
+
+	bool run(run_func_type func, Args ...args)
+	{
+		LARGE_INTEGER freq;
+		if (!QueryPerformanceFrequency(&freq)) {
+			win_error_code = GetLastError();
+			return false;
+		}
+
+		win_time_perf_frequency = 1.0 / static_cast<bench_time_t>(freq.QuadPart);
+		inverse_iterations = 1.0 / static_cast<bench_time_t>(tnum_iterations);
+
+		for (template_int_t i = 0; i < tnum_iterations; ++i)
+		{
+			if (!QueryPerformanceCounter(&win_perf_counter)) {
+				win_error_code = GetLastError();
+				return false;
+			}
+
+			func(args...);
+
+			if (!QueryPerformanceCounter(&win_perf_counter_end)) {
+				win_error_code = GetLastError();
+				return false;
+			}
+
+			bench_time_t diff = static_cast<bench_time_t>(win_perf_counter_end.QuadPart - win_perf_counter.QuadPart);
+			time_value_avg += diff * win_time_perf_frequency;
+		}
+
+		time_value_avg *= inverse_iterations;
+
+		std::cout	<< "-----------------------------------------------\n"
+					<< "Time (seconds): " << time_value_avg << "\n"
+					<< "Num Iterations: " << tnum_iterations << "\n"
+					<< "Performance Frequency: " << freq.QuadPart << "\n"
+					<< "-----------------------------------------------\n"
+					<< std::endl;
+
+		return true;
+	}
+};
+
+CU_FUNC void vertex_cmem_test(bool print_vals, std::size_t iterations)
+{
+	vertex_cmem_t vmem;
+
+	constexpr float sz = 1.0f / static_cast<float>(vertex_cmem_t::array_length);
+
+	for (std::size_t i = 0; i < vmem.array_length; ++i) {
+		auto & [
+				position,
+				color_r,
+				color_g,
+				color_b,
+				color_a
+			] = std::tie(
+				vertex_cmem_get(vmem, position, i),
+				vertex_cmem_get(vmem, color_r, i),
+				vertex_cmem_get(vmem, color_g, i),
+				vertex_cmem_get(vmem, color_b, i),
+				vertex_cmem_get(vmem, color_a, i)
+			);
+
+		for (std::size_t x = 0; x < iterations; ++x) {
+			position = DirectX::XMVectorSet(0.0f, static_cast<float>(i), 0.0f, 1.0f);
+			color_r = static_cast<uint8_t>(255.0f * sz * static_cast<float>(i));
+			color_g = 0;
+			color_b = 0;
+			color_a = 255;
+		}
+	}
+
+	if (print_vals)
+	{
+		for (std::size_t i = 0; i < vmem.array_length; ++i) {
+			const auto & [
+				position,
+				color_r,
+				color_g,
+				color_b,
+				color_a
+			] = std::tie(
+				vertex_cmem_get(vmem, position, i),
+				vertex_cmem_get(vmem, color_r, i),
+				vertex_cmem_get(vmem, color_g, i),
+				vertex_cmem_get(vmem, color_b, i),
+				vertex_cmem_get(vmem, color_a, i)
+			);
+
+			std::cout << i << "\n---\n\n"
+					  << CU_STREAM_VALUE(DirectX::XMVectorGetY(position))
+					  << CU_STREAM_VALUE(color_r)
+					  << CU_STREAM_VALUE(color_g)
+					  << CU_STREAM_VALUE(color_b)
+					  << CU_STREAM_VALUE(color_a)
+					  << "------\n"
+					  << std::endl;
+		}
+	}
+}
+
+#define CU_DEFAULT_IN_ITERATIONS 10000
+
+#define CU_BENCHMARK_TYPE(func) benchmark<1000, decltype(&func), bool, std::size_t>
+
+using vertex_cmem_test_benchmark_t = CU_BENCHMARK_TYPE(vertex_cmem_test);
+
+CU_FUNC void vertex_array_test(bool print_vals, std::size_t iterations)
+{
+	vertex_array_t varray;
+
+	constexpr float sz = 1.0f / static_cast<float>(vertex_cmem_t::array_length);
+
+	 for (std::size_t i = 0; i < varray.size(); ++i) {
+		for (std::size_t x = 0; x < iterations; ++x) {
+			varray[i].position = DirectX::XMVectorSet(0.0f, static_cast<float>(i), 0.0f, 1.0f);
+			varray[i].color_r = static_cast<uint8_t>(255.0f * sz * static_cast<float>(i));
+			varray[i].color_g = 0;
+			varray[i].color_b = 0;
+			varray[i].color_a = 255;
+		}
+	}
+
+	if (print_vals)
+	{
+		for (std::size_t i = 0; i < varray.size(); ++i) {
+			std::cout << i << "\n---\n\n"
+					  << CU_STREAM_VALUE(DirectX::XMVectorGetY(varray[i].position))
+					  << CU_STREAM_VALUE(varray[i].color_r)
+					  << CU_STREAM_VALUE(varray[i].color_g)
+					  << CU_STREAM_VALUE(varray[i].color_b)
+					  << CU_STREAM_VALUE(varray[i].color_a)
+					  << "------\n"
+					  << std::endl;
+		}
+	}
+}
+
+using vertex_array_test_benchmark_t = CU_BENCHMARK_TYPE(vertex_array_test);
+
 CU_FUNC void contig_print()
 {
 	contig1_t lol;
@@ -344,10 +580,10 @@ CU_FUNC void contig_print()
 		<< std::endl;
 
 	{
-		auto &a = member<0>(lol, 1);
-		auto &b = member<1>(lol, 1);
-		auto &c = member<2>(lol, 1);
-		auto &d = member<3>(lol, 1);
+		auto &a = member<0, 1>(lol);
+		auto &b = member<1, 1>(lol);
+		auto &c = member<2, 1>(lol);
+		auto &d = member<3, 1>(lol);
 
 		a = CU_MAX(uint32_t);
 		b = CU_MAX(uint16_t);

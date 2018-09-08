@@ -13,6 +13,14 @@ int main()
 
 	std::cout << CU_SIZEOF_STRING(arr_t) << std::endl;
 
+	std::cout << "\n\nnon-cached\n";
+	cu::test::vertex_array_test_benchmark_t va{};
+	va.run(cu::test::vertex_array_test, false, CU_DEFAULT_IN_ITERATIONS);
+
+	std::cout << "cache memory\n";
+	cu::test::vertex_cmem_test_benchmark_t vb{};
+	vb.run(cu::test::vertex_cmem_test, false, CU_DEFAULT_IN_ITERATIONS);
+
 	cu::test::contig_print();
 	cu::test::print_constexpr_max();
 	cu::test::print_cache_params<u64_t, base_t>();
